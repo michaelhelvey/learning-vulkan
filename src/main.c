@@ -109,7 +109,25 @@ typedef struct vk_context
 
     uint32_t swapchain_image_count;
     VkImage *swapchain_images;
+
+    uint32_t image_views_count;
     VkImageView *image_views;
+
+    // pipeline
+    VkPipeline pipeline;
+    VkRenderPass render_pass;
+
+    // framebuffers
+    uint32_t framebuffer_count;
+    VkFramebuffer *framebuffers;
+
+    VkCommandPool command_pool;
+    VkCommandBuffer command_buffer;
+
+    // sync:
+    VkSemaphore sem_image_available;
+    VkSemaphore sem_render_finished;
+    VkFence fence_in_flight;
 } vk_context;
 
 // Allocates and initializes a new vk_context on the heap
@@ -130,6 +148,12 @@ vk_context *vk_context_alloc(SDL_Window *window)
     vk_queue_indices_init(&ctx->queue_indices);
 
     ctx->swapchain_image_count = 0;
+    ctx->image_views_count = 0;
+    ctx->swapchain_image_count = 0;
+
+    ctx->render_pass = VK_NULL_HANDLE;
+    ctx->command_pool = VK_NULL_HANDLE;
+    ctx->command_buffer = VK_NULL_HANDLE;
     return ctx;
 }
 
@@ -665,6 +689,7 @@ void vk_init_image_views(vk_context *context)
         vk_checked(vkCreateImageView(context->logical_device, &create_info, NULL, &image_views[i]));
     }
 
+    context->image_views_count = context->swapchain_image_count;
     context->image_views = image_views;
     dbg("successfully initialized image views\n");
 }
@@ -689,7 +714,7 @@ shader_read_result read_shader_code(const char *path)
 
     if (result.code == NULL)
     {
-        dbg("could not allocate %d bytes of memory with alignment %d: %s\n", 1024,
+        dbg("could not allocate %d bytes of memory with alignment %lu: %s\n", 1024,
             alignof(uint32_t), strerror(errno));
         exit(1);
     }
@@ -753,6 +778,8 @@ VkShaderModule create_shader_module(vk_context *context, size_t code_size, char 
 
 void vk_init_graphics_pipeline(vk_context *context)
 {
+    assert(context->render_pass != VK_NULL_HANDLE &&
+           "expected context->render_pass to be initialized befoore creating graphics pipeline");
     // load our shaders:
     shader_read_result vert_shader = read_shader_code("shaders/shader.vert.spv");
     shader_read_result frag_shader = read_shader_code("shaders/shader.frag.spv");
@@ -785,7 +812,7 @@ void vk_init_graphics_pipeline(vk_context *context)
 
     // configure fixed-function operations:
 
-    // describe the foramt of the vertex data passed to vetex shader:
+    // describe the format of the vertex data passed to vertex shader:
     VkPipelineVertexInputStateCreateInfo vertex_input_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = 0,
@@ -820,6 +847,7 @@ void vk_init_graphics_pipeline(vk_context *context)
         .extent = context->swapchain_extent,
     };
 
+    // If we _did_ want to set this dynamically, we could do it here:
     // VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     // VkPipelineDynamicStateCreateInfo dynamic_state = {
     //     .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
@@ -907,6 +935,45 @@ void vk_init_graphics_pipeline(vk_context *context)
     vk_checked(vkCreatePipelineLayout(context->logical_device, &pipeline_layout_create_info, NULL,
                                       &pipeline_layout));
 
+    VkGraphicsPipelineCreateInfo pipeline_create_info = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2,
+        .pStages = shader_stage_create_infos,
+        .pVertexInputState = &vertex_input_info,
+        .pInputAssemblyState = &input_assembly_info,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterizer_create_info,
+        .pMultisampleState = &multi_sampling,
+        .pDepthStencilState = NULL,
+        .pColorBlendState = &color_blend_state,
+        .pDynamicState = NULL, // is this required?  I'm trying to opt out of dynamic state here
+        .layout = pipeline_layout,
+        .renderPass = context->render_pass,
+        .subpass = 0,
+        // so we can use these to set up another pipeline that is derived from this one
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = -1,
+    };
+
+    VkPipeline pipeline;
+    vk_checked(vkCreateGraphicsPipelines(context->logical_device, VK_NULL_HANDLE, 1,
+                                         &pipeline_create_info, NULL, &pipeline));
+
+    context->pipeline = pipeline;
+
+    // Because after the graphics pipeline has finished being created all this will have been
+    // compiled to machine code, we can safely free / de-init all our shader code & modules
+    // at the end of pipeline creation:
+    vkDestroyShaderModule(context->logical_device, vert_mod, NULL);
+    vkDestroyShaderModule(context->logical_device, frag_mod, NULL);
+    free(vert_shader.code);
+    free(frag_shader.code);
+
+    dbg("successfully enabled graphics pipeline\n");
+}
+
+void vk_init_render_pass(vk_context *context)
+{
     // Create an attachment for our color buffer:
     VkAttachmentDescription color_attachment = {
         .format = context->swapchain_image_format,
@@ -935,48 +1002,201 @@ void vk_init_graphics_pipeline(vk_context *context)
         .pColorAttachments = &color_attachment_ref,
     };
 
+    // Ensure that the render pass waits for the color attachment output bit stage:
+    VkSubpassDependency dependency = {
+        .srcSubpass = VK_SUBPASS_EXTERNAL, // implicit subpass before render
+        .dstSubpass = 0,
+        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcAccessMask = 0,
+        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    };
+
     VkRenderPass render_pass;
     VkRenderPassCreateInfo render_pass_info = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
                                                .attachmentCount = 1,
                                                .pAttachments = &color_attachment,
                                                .subpassCount = 1,
-                                               .pSubpasses = &subpass};
+                                               .pSubpasses = &subpass,
+                                               .dependencyCount = 1,
+                                               .pDependencies = &dependency};
 
     vk_checked(vkCreateRenderPass(context->logical_device, &render_pass_info, NULL, &render_pass));
+    context->render_pass = render_pass;
 
-    VkGraphicsPipelineCreateInfo pipeline_create_info = {
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .stageCount = 2,
-        .pStages = shader_stage_create_infos,
-        .pVertexInputState = &vertex_input_info,
-        .pInputAssemblyState = &input_assembly_info,
-        .pViewportState = &viewport_state,
-        .pRasterizationState = &rasterizer_create_info,
-        .pMultisampleState = &multi_sampling,
-        .pDepthStencilState = NULL,
-        .pColorBlendState = &color_blend_state,
-        .pDynamicState = NULL, // is this required?  I'm trying to opt out of dynamic state here
-        .layout = pipeline_layout,
-        .renderPass = render_pass,
-        .subpass = 0,
-        // so we can use these to set up another pipeline that is derived from this one
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = -1,
+    dbg("successfully initialized render pass\n");
+}
+
+void vk_init_frame_buffers(vk_context *context)
+{
+    assert(context->image_views_count > 0 && context->render_pass != VK_NULL_HANDLE &&
+           "expected context image views & render pass to be initialized before frame buffers");
+    VkFramebuffer *swapchain_frame_buffers =
+        calloc(context->image_views_count, sizeof(VkFramebuffer));
+
+    for (uint32_t i = 0; i < context->image_views_count; i++)
+    {
+        VkFramebufferCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = context->render_pass,
+            .attachmentCount = 1,
+            .pAttachments = &context->image_views[i],
+            .width = context->swapchain_extent.width,
+            .height = context->swapchain_extent.height,
+            .layers = 1,
+        };
+
+        vk_checked(vkCreateFramebuffer(context->logical_device, &create_info, NULL,
+                                       &swapchain_frame_buffers[i]));
+    }
+
+    context->framebuffer_count = context->image_views_count;
+    context->framebuffers = swapchain_frame_buffers;
+
+    dbg("successfully initialized frame buffers\n");
+}
+
+void vk_init_command_pool(vk_context *context)
+{
+    VkCommandPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        // allow command buffers to be re-recorded individually
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = context->queue_indices.graphics,
     };
 
-    VkPipeline pipeline;
-    vk_checked(vkCreateGraphicsPipelines(context->logical_device, VK_NULL_HANDLE, 1,
-                                         &pipeline_create_info, NULL, &pipeline));
+    VkCommandPool command_pool;
+    vk_checked(vkCreateCommandPool(context->logical_device, &pool_info, NULL, &command_pool));
 
-    // Because after the graphics pipeline has finished being created all this will have been
-    // compiled to machine code, we can safely free / de-init all our shader code & modules
-    // at the end of pipeline creation:
-    vkDestroyShaderModule(context->logical_device, vert_mod, NULL);
-    vkDestroyShaderModule(context->logical_device, frag_mod, NULL);
-    free(vert_shader.code);
-    free(frag_shader.code);
+    context->command_pool = command_pool;
+    dbg("successfully initialized command pool\n");
+}
 
-    dbg("successfully enabled graphics pipeline\n");
+void vk_init_command_buffers(vk_context *context)
+{
+    assert(context->command_pool != VK_NULL_HANDLE &&
+           "expected context->command_pool to be initialized before initializing command buffers");
+
+    VkCommandBufferAllocateInfo buffer_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = context->command_pool,
+        // can be submitted to a queue for execution, but cannot be called from other command
+        // buffers
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+
+    VkCommandBuffer command_buffer;
+    vk_checked(
+        vkAllocateCommandBuffers(context->logical_device, &buffer_alloc_info, &command_buffer));
+
+    context->command_buffer = command_buffer;
+    dbg("sucessfully initialized command buffer\n");
+}
+
+void vk_record_command_buffer(vk_context *context, uint32_t image_index)
+{
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = 0,
+        .pInheritanceInfo = NULL,
+    };
+
+    vk_checked(vkBeginCommandBuffer(context->command_buffer, &begin_info));
+
+    VkClearValue clear_color = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
+    VkRenderPassBeginInfo render_pass_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = context->render_pass,
+        .framebuffer = context->framebuffers[image_index],
+        .renderArea =
+            (VkRect2D){
+                .extent = context->swapchain_extent,
+                .offset = {0, 0},
+            },
+        .clearValueCount = 1,
+        .pClearValues = &clear_color,
+    };
+
+    vkCmdBeginRenderPass(context->command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(context->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, context->pipeline);
+
+    vkCmdDraw(context->command_buffer, 3, 1, 0, 0);
+    vkCmdEndRenderPass(context->command_buffer);
+    vk_checked(vkEndCommandBuffer(context->command_buffer));
+
+    dbg("successfully recorded image %d to command buffer\n", image_index);
+}
+
+void vk_init_sync(vk_context *context)
+{
+    VkSemaphoreCreateInfo sem_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+    };
+
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        // Start in the signaled state so the first draw_frame call isn't waiting
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    };
+
+    vk_checked(
+        vkCreateSemaphore(context->logical_device, &sem_info, NULL, &context->sem_image_available));
+    vk_checked(
+        vkCreateSemaphore(context->logical_device, &sem_info, NULL, &context->sem_render_finished));
+    vk_checked(
+        vkCreateFence(context->logical_device, &fence_info, NULL, &context->fence_in_flight));
+
+    dbg("successfully initialized semaphores and fences\n");
+}
+
+void draw_frame(vk_context *context)
+{
+    assert(context->command_buffer != VK_NULL_HANDLE &&
+           "expected command buffer to be initialized\n");
+    // wait for the previous frame to finish
+    vkWaitForFences(context->logical_device, 1, &context->fence_in_flight, VK_TRUE, UINT64_MAX);
+    vkResetFences(context->logical_device, 1, &context->fence_in_flight);
+
+    // acquire an image from the swap chain
+    uint32_t image_index;
+    vkAcquireNextImageKHR(context->logical_device, context->swapchain, UINT64_MAX,
+                          context->sem_image_available, VK_NULL_HANDLE, &image_index);
+
+    // record a command buffer which draws the scene onto that image
+    vkResetCommandBuffer(context->command_buffer, 0);
+    vk_record_command_buffer(context, image_index);
+
+    // submit the recorded command buffer
+    VkSemaphore wait_semaphores[] = {context->sem_image_available};
+    VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+    VkSemaphore signal_semaphores[] = {context->sem_render_finished};
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = wait_semaphores,
+        .pWaitDstStageMask = wait_stages,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &context->command_buffer,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = signal_semaphores,
+    };
+    vk_checked(vkQueueSubmit(context->graphics_queue, 1, &submit_info, context->fence_in_flight));
+
+    // present the swap chain image
+    VkSwapchainKHR swapchains[] = {context->swapchain};
+    VkPresentInfoKHR present_info = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = signal_semaphores,
+        .swapchainCount = 1,
+        .pSwapchains = swapchains,
+        .pImageIndices = &image_index,
+        .pResults = NULL,
+    };
+
+    vkQueuePresentKHR(context->presentation_queue, &present_info);
 }
 
 int main()
@@ -1005,10 +1225,13 @@ int main()
     vk_init_queue_handles(ctx);
     vk_init_swap_chain(ctx);
     vk_init_image_views(ctx);
+    vk_init_render_pass(ctx);
     vk_init_graphics_pipeline(ctx);
+    vk_init_frame_buffers(ctx);
+    vk_init_command_pool(ctx);
+    vk_init_command_buffers(ctx);
+    vk_init_sync(ctx);
 
-    // If we get to a black screen without crashing or the validation layer yelling at us I'm
-    // calling it a success.
     dbg("succesfully initialized vulkan\n");
 
     bool running = true;
@@ -1024,5 +1247,7 @@ int main()
                 break;
             }
         }
+        draw_frame(ctx);
     }
+    vkDeviceWaitIdle(ctx->logical_device);
 }
