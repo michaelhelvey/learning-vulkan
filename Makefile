@@ -1,12 +1,16 @@
 CC := clang
-OBJC := clang
 BUILDDIR := build
 SRCDIR := src
 TARGET := $(BUILDDIR)/main
 MODE ?= debug
+GLSLC := glslc
 
-SRCS := $(wildcard $(SRCDIR)/*.c) $(wildcard $(SRCDIR)/*.m)
-OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS:.m=.c))
+SHADERDIR := shaders
+SHADERS := $(wildcard $(SHADERDIR)/*.frag $(SHADERDIR)/*.vert)
+SHADERS_OUT := $(SHADERS:%=%.spv)
+
+SRCS := $(wildcard $(SRCDIR)/*.c)
+OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 
 INCLUDE_FLAGS := -I/usr/local/include/ -I/opt/homebrew/include
 
@@ -27,17 +31,18 @@ LDFLAGS := \
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(LDFLAGS) $^ -o $@
+$(TARGET): $(OBJS) $(SHADERS_OUT)
+	$(CC) $(LDFLAGS) $(OBJS) -o $@
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.m | $(BUILDDIR)
-	$(OBJC) $(CFLAGS) -c $< -o $@
-
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
+%.spv: %
+	$(GLSLC) $< -o $@
+
 clean:
 	rm -rf $(BUILDDIR)
+	rm -f $(SHADERS_OUT)

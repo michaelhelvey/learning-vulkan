@@ -3,6 +3,8 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 #include <assert.h>
+#include <errno.h>
+#include <stdalign.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -102,9 +104,12 @@ typedef struct vk_context
     // swap chain support details:
     vk_swapchain_support *swapchain_support;
     VkSwapchainKHR swapchain;
+    VkFormat swapchain_image_format;
+    VkExtent2D swapchain_extent;
 
     uint32_t swapchain_image_count;
     VkImage *swapchain_images;
+    VkImageView *image_views;
 } vk_context;
 
 // Allocates and initializes a new vk_context on the heap
@@ -383,8 +388,8 @@ void vk_init_logical_device(vk_context *context)
 
     // handle the case that graphics & presentation queue are different indices:
     uint32_t queue_family_length = 2;
-    uint32_t queue_families[2] = {context->queue_indices.graphics,
-                                  context->queue_indices.presentation};
+    uint32_t queue_families[] = {context->queue_indices.graphics,
+                                 context->queue_indices.presentation};
 
     if (queue_families[0] == queue_families[1])
     {
@@ -592,8 +597,8 @@ void vk_init_swap_chain(vk_context *context)
     };
 
     // set up queue sharing modes:
-    uint32_t queue_family_indices[2] = {context->queue_indices.graphics,
-                                        context->queue_indices.presentation};
+    uint32_t queue_family_indices[] = {context->queue_indices.graphics,
+                                       context->queue_indices.presentation};
 
     if (context->queue_indices.graphics != context->queue_indices.presentation)
     {
@@ -624,8 +629,354 @@ void vk_init_swap_chain(vk_context *context)
 
     context->swapchain_images = images;
     context->swapchain_image_count = actual_image_count;
+    context->swapchain_image_format = surface_format.format;
+    context->swapchain_extent = extent;
 
     dbg("retrieved swapchain image handles with count = %d\n", actual_image_count);
+}
+
+void vk_init_image_views(vk_context *context)
+{
+    VkImageView *image_views = calloc(context->swapchain_image_count, sizeof(VkImageView));
+    for (uint32_t i = 0; i < context->swapchain_image_count; i++)
+    {
+        VkImageViewCreateInfo create_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                             .image = context->swapchain_images[i],
+                                             .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                             .format = context->swapchain_image_format,
+                                             .components =
+                                                 (VkComponentMapping){
+                                                     .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                                     .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                                     .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                                     .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                                 },
+                                             .subresourceRange =
+                                                 (VkImageSubresourceRange){
+                                                     .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                                     .baseMipLevel = 0,
+                                                     .levelCount = 1,
+                                                     .baseArrayLayer = 0,
+                                                     .layerCount = 1,
+                                                 }
+
+        };
+
+        vk_checked(vkCreateImageView(context->logical_device, &create_info, NULL, &image_views[i]));
+    }
+
+    context->image_views = image_views;
+    dbg("successfully initialized image views\n");
+}
+
+typedef struct shader_read_result
+{
+    char *code;
+    size_t size;
+    size_t cap;
+} shader_read_result;
+
+shader_read_result read_shader_code(const char *path)
+{
+    shader_read_result result = {
+        // I'm not sure I actually need to do this...maybe I could just malloc()...but the spec
+        // says that malloc only guarantees alignment for objects of <type>, so like, it could
+        // return a 2-aligned address that would break my uint32_t* cast later on right?
+        .code = aligned_alloc(alignof(void *), 1024),
+        .size = 0,
+        .cap = 1024,
+    };
+
+    if (result.code == NULL)
+    {
+        dbg("could not allocate %d bytes of memory with alignment %d: %s\n", 1024,
+            alignof(uint32_t), strerror(errno));
+        exit(1);
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL)
+    {
+        dbg("could not read shader file at path %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+
+    for (;;)
+    {
+        // potentially resize code buffer:
+        if (result.size == result.cap)
+        {
+            size_t new_size = result.cap * 2;
+            dbg("(%s): resizing code buffer from %lu to %lu\n", path, result.cap, new_size);
+            result.code = realloc(result.code, new_size);
+
+            if (result.code == NULL)
+            {
+                dbg("unable to realloc code buffer: OOM\n");
+                exit(1);
+            }
+
+            result.cap = new_size;
+        }
+
+        size_t requested_bytes = result.cap - result.size;
+        size_t bytes_read = fread(result.code + result.size, 1, requested_bytes, file);
+        result.size = result.size + bytes_read;
+
+        if (bytes_read < requested_bytes)
+        {
+            break;
+        }
+    }
+
+    // If the read that broke the loop was an error, crash:
+    if (ferror(file))
+    {
+        dbg("error reading from file stream: %s\n", strerror(errno));
+        exit(1);
+    }
+
+    dbg("successfully read %lu bytes of shader bytecode from %s\n", result.size, path);
+    return result;
+}
+
+VkShaderModule create_shader_module(vk_context *context, size_t code_size, char *code)
+{
+    VkShaderModule mod;
+    VkShaderModuleCreateInfo create_info = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                            .codeSize = code_size,
+                                            .pCode = (uint32_t *)code};
+    vk_checked(vkCreateShaderModule(context->logical_device, &create_info, NULL, &mod));
+
+    return mod;
+}
+
+void vk_init_graphics_pipeline(vk_context *context)
+{
+    // load our shaders:
+    shader_read_result vert_shader = read_shader_code("shaders/shader.vert.spv");
+    shader_read_result frag_shader = read_shader_code("shaders/shader.frag.spv");
+
+    // create shader modules:
+    VkShaderModule vert_mod = create_shader_module(context, vert_shader.size, vert_shader.code);
+    VkShaderModule frag_mod = create_shader_module(context, frag_shader.size, frag_shader.code);
+
+    // create shader stages:
+    VkPipelineShaderStageCreateInfo vertex_shader_stage_create = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+        .module = vert_mod,
+        .pName = "main",
+        // Init any shader constants here:
+        .pSpecializationInfo = NULL,
+    };
+
+    VkPipelineShaderStageCreateInfo frag_shader_stage_create = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .module = frag_mod,
+        .pName = "main",
+        // Init any shader constants here:
+        .pSpecializationInfo = NULL,
+    };
+
+    VkPipelineShaderStageCreateInfo shader_stage_create_infos[] = {vertex_shader_stage_create,
+                                                                   frag_shader_stage_create};
+
+    // configure fixed-function operations:
+
+    // describe the foramt of the vertex data passed to vetex shader:
+    VkPipelineVertexInputStateCreateInfo vertex_input_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = NULL,
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = NULL,
+    };
+
+    // describe the kind of geometry drawn from the vertices and if primitive restart should be
+    // enabled
+    VkPipelineInputAssemblyStateCreateInfo input_assembly_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .primitiveRestartEnable = VK_FALSE, // not required for non-strip topologies
+    };
+
+    VkViewport viewport = {
+        .x = 0.0f,
+        .y = 0.0f,
+        .width = context->swapchain_extent.width,
+        .height = context->swapchain_extent.height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
+
+    VkRect2D scissor = {
+        .offset =
+            (VkOffset2D){
+                .x = 0,
+                .y = 0,
+            },
+        .extent = context->swapchain_extent,
+    };
+
+    // VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    // VkPipelineDynamicStateCreateInfo dynamic_state = {
+    //     .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+    //     .dynamicStateCount = 2,
+    //     .pDynamicStates = dynamic_states,
+    // };
+
+    // Opting out of dynamic viewport and scissor state by specifying them directly:
+    VkPipelineViewportStateCreateInfo viewport_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .pViewports = &viewport,
+        .scissorCount = 1,
+        .pScissors = &scissor,
+    };
+
+    VkPipelineRasterizationStateCreateInfo rasterizer_create_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        // VK_TRUE = fragments beyond the near and far plans are clamped to them instead of
+        // discarding them (GPU feature required).
+        .depthClampEnable = VK_FALSE,
+        // VK_TRUE = geometry never passes through the rasterizer stage, disabling all output to
+        // the framebuffer
+        .rasterizerDiscardEnable = VK_FALSE,
+        // determines how fragments are generated for geometry (fill, line, or point)
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .lineWidth = 1.0f,
+        .cullMode = VK_CULL_MODE_BACK_BIT,
+        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+        .depthBiasEnable = VK_FALSE,
+        // Sometimes adjusted for shadow mapping:
+        .depthBiasConstantFactor = 0.0f,
+        .depthBiasClamp = 0.0f,
+        .depthBiasSlopeFactor = 0.0f,
+    };
+
+    // keep multisampling disabled for now:
+    VkPipelineMultisampleStateCreateInfo multi_sampling = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .sampleShadingEnable = VK_FALSE,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .minSampleShading = 1.0f,
+        .pSampleMask = NULL,
+        .alphaToCoverageEnable = VK_FALSE,
+        .alphaToOneEnable = VK_FALSE,
+    };
+
+    // TODO: configure depth and stencil buffers:
+
+    // color blending: turn off both modes so that fragment colors are passed through to the final
+    // image unmodified
+    // configure color blending for our 1 framebuffer:
+    VkPipelineColorBlendAttachmentState color_blend_attachment = {
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        .blendEnable = false,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+    };
+
+    // set constants to be used in the operations described by the blend attachment:
+    VkPipelineColorBlendStateCreateInfo color_blend_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .logicOpEnable = VK_FALSE,
+        .logicOp = VK_LOGIC_OP_COPY,
+        .attachmentCount = 1,
+        .pAttachments = &color_blend_attachment,
+        .blendConstants = {0.0f, 0.0f, 0.0f, 0.0f},
+    };
+
+    // create the pipeline
+    // specify uniform values for the pipeline via the pipeline layout:
+    VkPipelineLayout pipeline_layout;
+    VkPipelineLayoutCreateInfo pipeline_layout_create_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 0,
+        .pSetLayouts = NULL,
+        .pushConstantRangeCount = 0,
+        .pPushConstantRanges = NULL,
+    };
+    vk_checked(vkCreatePipelineLayout(context->logical_device, &pipeline_layout_create_info, NULL,
+                                      &pipeline_layout));
+
+    // Create an attachment for our color buffer:
+    VkAttachmentDescription color_attachment = {
+        .format = context->swapchain_image_format,
+        // update for multi-sampling
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        // clear the data in the attachment before and after rendering
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        // keep the rendered contents in memory so we can read them later
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        // we are not doing anything with the stencil buffer:
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        // images to be presented in the swap chain:
+        .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    };
+
+    VkAttachmentReference color_attachment_ref = {
+        .attachment = 0, // this is the index referenced by the `layout(location)` in the shaders
+        .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    };
+
+    VkSubpassDescription subpass = {
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color_attachment_ref,
+    };
+
+    VkRenderPass render_pass;
+    VkRenderPassCreateInfo render_pass_info = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+                                               .attachmentCount = 1,
+                                               .pAttachments = &color_attachment,
+                                               .subpassCount = 1,
+                                               .pSubpasses = &subpass};
+
+    vk_checked(vkCreateRenderPass(context->logical_device, &render_pass_info, NULL, &render_pass));
+
+    VkGraphicsPipelineCreateInfo pipeline_create_info = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2,
+        .pStages = shader_stage_create_infos,
+        .pVertexInputState = &vertex_input_info,
+        .pInputAssemblyState = &input_assembly_info,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterizer_create_info,
+        .pMultisampleState = &multi_sampling,
+        .pDepthStencilState = NULL,
+        .pColorBlendState = &color_blend_state,
+        .pDynamicState = NULL, // is this required?  I'm trying to opt out of dynamic state here
+        .layout = pipeline_layout,
+        .renderPass = render_pass,
+        .subpass = 0,
+        // so we can use these to set up another pipeline that is derived from this one
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = -1,
+    };
+
+    VkPipeline pipeline;
+    vk_checked(vkCreateGraphicsPipelines(context->logical_device, VK_NULL_HANDLE, 1,
+                                         &pipeline_create_info, NULL, &pipeline));
+
+    // Because after the graphics pipeline has finished being created all this will have been
+    // compiled to machine code, we can safely free / de-init all our shader code & modules
+    // at the end of pipeline creation:
+    vkDestroyShaderModule(context->logical_device, vert_mod, NULL);
+    vkDestroyShaderModule(context->logical_device, frag_mod, NULL);
+    free(vert_shader.code);
+    free(frag_shader.code);
+
+    dbg("successfully enabled graphics pipeline\n");
 }
 
 int main()
@@ -653,6 +1004,8 @@ int main()
     vk_init_logical_device(ctx);
     vk_init_queue_handles(ctx);
     vk_init_swap_chain(ctx);
+    vk_init_image_views(ctx);
+    vk_init_graphics_pipeline(ctx);
 
     // If we get to a black screen without crashing or the validation layer yelling at us I'm
     // calling it a success.
