@@ -1,10 +1,8 @@
-#include "SDL2/SDL_error.h"
 #include "SDL2/SDL_video.h"
 #include "vulkan/vulkan_core.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 #include <assert.h>
-#include <complex.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -56,9 +54,9 @@ const char *required_logic_dev_layers_names[REQUIRED_LOGIC_DEV_LAYERS_LEN] = {
     VK_KHR_VALIDATION_LAYER_NAME};
 
 // Required extensions for a logical device
-#define REQUIRED_LOGIC_DEV_EXT_LEN 1
+#define REQUIRED_LOGIC_DEV_EXT_LEN 2
 const char *required_logic_dev_ext_names[REQUIRED_LOGIC_DEV_EXT_LEN] = {
-    VK_KHR_PORTABILITY_SUBSET_EXT_NAME};
+    VK_KHR_PORTABILITY_SUBSET_EXT_NAME, VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
 // Temporary struct used to store graphics & presentation queue indices during device init that
 // we can examine to check whether the device supports the queues we need;
@@ -79,8 +77,19 @@ bool vk_queue_indices_is_suitable(vk_queue_indices *indices)
     return indices->graphics != -1 && indices->presentation != -1;
 }
 
+typedef struct vk_swapchain_support
+{
+    VkSurfaceCapabilitiesKHR *surface_capabilities;
+    uint32_t surface_formats_count;
+    VkSurfaceFormatKHR *surface_formats;
+
+    uint32_t present_modes_count;
+    VkPresentModeKHR *present_modes;
+} vk_swapchain_support;
+
 typedef struct vk_context
 {
+    SDL_Window *window;
     VkInstance instance;
     VkPhysicalDevice physical_device;
     VkDevice logical_device;
@@ -89,13 +98,22 @@ typedef struct vk_context
     VkQueue presentation_queue;
     // used as scratch space during the is_device_suitable_loop
     vk_queue_indices queue_indices;
+
+    // swap chain support details:
+    vk_swapchain_support *swapchain_support;
+    VkSwapchainKHR swapchain;
+
+    uint32_t swapchain_image_count;
+    VkImage *swapchain_images;
 } vk_context;
 
 // Allocates and initializes a new vk_context on the heap
-vk_context *vk_context_alloc()
+vk_context *vk_context_alloc(SDL_Window *window)
 {
     vk_context *ctx = (vk_context *)malloc(sizeof(vk_context));
+    ctx->window = window;
     ctx->instance = VK_NULL_HANDLE;
+    ctx->swapchain_support = NULL;
 
     ctx->physical_device = VK_NULL_HANDLE;
     ctx->logical_device = VK_NULL_HANDLE;
@@ -105,6 +123,8 @@ vk_context *vk_context_alloc()
 
     ctx->surface = VK_NULL_HANDLE;
     vk_queue_indices_init(&ctx->queue_indices);
+
+    ctx->swapchain_image_count = 0;
     return ctx;
 }
 
@@ -140,7 +160,7 @@ void vk_init_instance(vk_context *context, const char *app_name, SDL_Window *win
         extension_names[i] = required_inst_extensions[i - sdl_extension_count];
     }
     // print out the full list of extensions:
-    dbg_str_array(extension_names, extensions_count, "enabling extension: %s\n");
+    dbg_str_array(extension_names, extensions_count, "enabling instance extension: %s\n");
 
     // get all the available layers:
     uint32_t layer_count;
@@ -229,11 +249,47 @@ void vk_init_device_queue_indices(vk_context *context, VkPhysicalDevice device)
     }
 }
 
+// Takes physical_device as a parameter because we have to be able to query this for any physical
+// device and not just the one we finally settle on.
+static vk_swapchain_support *query_swap_chain_support_details(VkPhysicalDevice physical_device,
+                                                              VkSurfaceKHR surface)
+{
+    vk_swapchain_support *support = malloc(sizeof(vk_swapchain_support));
+    // query for swap chain support details:
+    VkSurfaceCapabilitiesKHR *capabilities = malloc(sizeof(VkSurfaceCapabilitiesKHR));
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, capabilities);
+
+    support->surface_capabilities = capabilities;
+
+    uint32_t format_count;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, NULL);
+
+    VkSurfaceFormatKHR *formats = calloc(format_count, sizeof(VkSurfaceFormatKHR));
+    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, formats);
+
+    support->surface_formats_count = format_count;
+    support->surface_formats = formats;
+
+    uint32_t present_modes_count;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_modes_count, NULL);
+
+    VkPresentModeKHR *present_modes = calloc(present_modes_count, sizeof(VkPresentModeKHR));
+    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_modes_count,
+                                              present_modes);
+
+    support->present_modes_count = present_modes_count;
+    support->present_modes = present_modes;
+
+    return support;
+}
+
 // For a given physical device, iterates over device properties and determines whether it supports
 // everything we need
-bool is_device_suitable(vk_context *context, VkPhysicalDevice device,
-                        VkPhysicalDeviceProperties *props)
+static bool is_device_suitable(vk_context *context, VkPhysicalDevice device,
+                               VkPhysicalDeviceProperties *props)
 {
+    assert(context->surface != VK_NULL_HANDLE &&
+           "context->surface must be initialized before querying for physical device suitability");
     vk_init_device_queue_indices(context, device);
     if (!vk_queue_indices_is_suitable(&context->queue_indices))
     {
@@ -264,6 +320,21 @@ bool is_device_suitable(vk_context *context, VkPhysicalDevice device,
         dbg("device %s does not have swapchain support\n", props->deviceName);
         return false;
     }
+
+    // Note: we leak this struct if we return false.  I think this is fine for now. If the user has
+    // GPUs connected they also probably have enough RAM not to care about a few bytes here and
+    // there :sunglasses:
+    vk_swapchain_support *support = query_swap_chain_support_details(device, context->surface);
+
+    // For our purposes, the support is adequate if there is at least one supported image format
+    // and one supported presentation mode given the window surface:
+    if (support->surface_formats_count == 0 || support->present_modes_count == 0)
+    {
+        dbg("swap chain does not have 1 format or present mode for the given surface\n");
+        return false;
+    }
+
+    context->swapchain_support = support;
 
     // At this point context->queue indexes will be set to whatever the indexes on the suitable
     // device are.
@@ -349,6 +420,8 @@ void vk_init_logical_device(vk_context *context)
         .enabledExtensionCount = REQUIRED_LOGIC_DEV_EXT_LEN,
         .ppEnabledExtensionNames = required_logic_dev_ext_names,
     };
+    dbg_str_array(required_logic_dev_ext_names, REQUIRED_LOGIC_DEV_EXT_LEN,
+                  "enabling logical device extension %s\n");
 
     VkDevice logical_device;
     vk_checked(
@@ -386,11 +459,180 @@ void vk_init_queue_handles(vk_context *context)
     dbg("successfully retrieved queue handles for logical device\n");
 }
 
+static VkSurfaceFormatKHR choose_swapchain_surface_format(vk_context *context)
+{
+    vk_swapchain_support *support = context->swapchain_support;
+    // choose swap surface format:
+    bool found_format = false;
+    VkSurfaceFormatKHR chosen_format;
+    for (uint32_t i = 0; i < support->surface_formats_count; i++)
+    {
+        VkSurfaceFormatKHR iter_format = support->surface_formats[i];
+        if (iter_format.format == VK_FORMAT_B8G8R8A8_SRGB &&
+            iter_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+        {
+            chosen_format = iter_format;
+            found_format = true;
+            break;
+        }
+    }
+
+    // if we made it through the loop and we didn't find one, just pick the first one:
+    // remember that we are guaranteed to have at least one format
+    if (!found_format)
+    {
+        chosen_format = support->surface_formats[0];
+    }
+
+    return chosen_format;
+}
+
+static VkPresentModeKHR choose_presentation_mode(vk_context *context)
+{
+    vk_swapchain_support *support = context->swapchain_support;
+    bool found_format = false;
+    VkPresentModeKHR chosen_mode;
+
+    for (uint32_t i = 0; i < support->present_modes_count; i++)
+    {
+        VkPresentModeKHR available = support->present_modes[i];
+        if (available == VK_PRESENT_MODE_MAILBOX_KHR)
+        {
+            dbg("chose presentation mode: VK_PRESENT_MODE_MAILBOX_KHR\n");
+            found_format = true;
+            chosen_mode = available;
+        }
+    }
+
+    // only VK_PRESENT_MODE_FIFO_KHR is guaranteed to be available, but we will try to select
+    // VK_PRESENT_MODE_MAILFIX_KHR if we can
+    if (!found_format)
+    {
+        dbg("chose presentation mode: VK_PRESENT_MODE_FIFO_KHR\n");
+        chosen_mode = VK_PRESENT_MODE_FIFO_KHR;
+    }
+
+    return chosen_mode;
+}
+
+uint32_t clamp(uint32_t value, uint32_t lb, uint32_t ub)
+{
+    // cmp w0, w1
+    // csel w8, w0, w1, HI
+    // etc
+    uint32_t t = value < lb ? lb : value;
+    return t > ub ? ub : value;
+}
+
+VkExtent2D choose_swap_extent(vk_context *context)
+{
+    VkSurfaceCapabilitiesKHR *capabilities = context->swapchain_support->surface_capabilities;
+    // If the window manager allows us to not specify the current extent as the resolution of the
+    // window, then it will set currentExtent to UINT32_MAX, and then it's on us to set the width
+    // and height in pixels based on the minimum and maximum image extent
+    if (capabilities->currentExtent.width != UINT32_MAX)
+    {
+        return capabilities->currentExtent;
+    }
+
+    int width, height;
+    SDL_Vulkan_GetDrawableSize(context->window, &width, &height);
+
+    VkExtent2D extent = {
+        .width = (uint32_t)width,
+        .height = (uint32_t)height,
+    };
+
+    extent.width =
+        clamp(extent.width, capabilities->minImageExtent.width, capabilities->maxImageExtent.width);
+    extent.height = clamp(extent.height, capabilities->minImageExtent.height,
+                          capabilities->maxImageExtent.height);
+
+    return extent;
+}
+
+void vk_init_swap_chain(vk_context *context)
+{
+    assert(context->swapchain_support &&
+           "context->swapchain_support must be initialized before initing swap chain");
+    VkSurfaceFormatKHR surface_format = choose_swapchain_surface_format(context);
+    VkPresentModeKHR present_mode = choose_presentation_mode(context);
+    VkExtent2D extent = choose_swap_extent(context);
+
+    VkSurfaceCapabilitiesKHR *capabilities = context->swapchain_support->surface_capabilities;
+    // choose how many images we want to have in the swap chain (1 more than the minimum):
+    uint32_t image_count = capabilities->minImageCount + 1;
+
+    // make sure we are not exceeding the maximum (where 0 means there is no maximum)
+    if (capabilities->maxImageCount > 0 && image_count > capabilities->maxImageCount)
+    {
+        image_count = capabilities->maxImageCount;
+    }
+    dbg("creating swapchain with %d min images\n", image_count);
+
+    VkSwapchainCreateInfoKHR create_info = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = context->surface,
+        .minImageCount = image_count,
+        .imageFormat = surface_format.format,
+        .imageColorSpace = surface_format.colorSpace,
+        .imageExtent = extent,
+        .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        // No pre-transformation of images:
+        .preTransform = capabilities->currentTransform,
+        // the alpha channel used for blending with other windows (ignored here):
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .presentMode = present_mode,
+        // we don't care about the color of pixels that are obscured:
+        .clipped = VK_TRUE,
+        // for now leave this null...eventually we will need to handle this to re-create the
+        // swapchain
+        .oldSwapchain = VK_NULL_HANDLE,
+    };
+
+    // set up queue sharing modes:
+    uint32_t queue_family_indices[2] = {context->queue_indices.graphics,
+                                        context->queue_indices.presentation};
+
+    if (context->queue_indices.graphics != context->queue_indices.presentation)
+    {
+        create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+        create_info.queueFamilyIndexCount = 2;
+        create_info.pQueueFamilyIndices = queue_family_indices;
+    }
+    else
+    {
+        create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        create_info.queueFamilyIndexCount = 0;
+        create_info.pQueueFamilyIndices = NULL;
+    }
+
+    VkSwapchainKHR swapchain;
+    vk_checked(vkCreateSwapchainKHR(context->logical_device, &create_info, NULL, &swapchain));
+    context->swapchain = swapchain;
+
+    dbg("sucessfully created swapchain \n");
+
+    // get handles to the swap chain images:
+    uint32_t actual_image_count;
+    vkGetSwapchainImagesKHR(context->logical_device, context->swapchain, &actual_image_count, NULL);
+
+    VkImage *images = calloc(actual_image_count, sizeof(VkImage));
+    vkGetSwapchainImagesKHR(context->logical_device, context->swapchain, &actual_image_count,
+                            images);
+
+    context->swapchain_images = images;
+    context->swapchain_image_count = actual_image_count;
+
+    dbg("retrieved swapchain image handles with count = %d\n", actual_image_count);
+}
+
 int main()
 {
     SDL_Window *window =
         SDL_CreateWindow("vulkan demo", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480,
-                         SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN);
+                         SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_ALLOW_HIGHDPI);
 
     if (window == NULL)
     {
@@ -404,12 +646,13 @@ int main()
         exit(1);
     }
 
-    vk_context *ctx = vk_context_alloc();
+    vk_context *ctx = vk_context_alloc(window);
     vk_init_instance(ctx, "vulkan demo", window);
     vk_init_surface(ctx, window);
     vk_init_physical_device(ctx);
     vk_init_logical_device(ctx);
     vk_init_queue_handles(ctx);
+    vk_init_swap_chain(ctx);
 
     // If we get to a black screen without crashing or the validation layer yelling at us I'm
     // calling it a success.
